@@ -157,39 +157,77 @@ func (a *AuthenticatorData) Unmarshal(rawAuthData []byte) error {
 	a.Flags = AuthenticatorFlags(rawAuthData[32])
 	a.Counter = binary.BigEndian.Uint32(rawAuthData[33:37])
 
-	remaining := len(rawAuthData) - minAuthDataLength
+	remaining := rawAuthData[minAuthDataLength:]
 
 	// Apple didn't read the W3C specification properly and sets the attestedCredentialData flag, while it's not present for an assertion. We'll just look a the length...
-	if len(rawAuthData) > minAuthDataLength {
-		a.unmarshalAttestedData(rawAuthData)
-		attDataLen := len(a.AttData.AAGUID) + 2 + len(a.AttData.CredentialID) + len(a.AttData.CredentialPublicKey)
-		remaining = remaining - attDataLen
+	if len(remaining) > 0 {
+		rest, err := a.unmarshalAttestedData(remaining)
+		if err == nil {
+			remaining = rest
+		} else if !a.Flags.HasExtensions() {
+			// Without the extension data flag there is nothing else the trailing
+			// bytes can be, so report the failure rather than silently ignoring it.
+			return err
+		}
 	}
 
-	if remaining != 0 {
+	// Authenticator data that sets the extension data flag carries a CBOR map of
+	// extensions after the attested credential data. iOS 27 is the first release
+	// to send one, reporting apple_bundle_version and apple_validation_category. 🤖
+	if a.Flags.HasExtensions() && len(remaining) > 0 {
+		a.ExtData = remaining
+		remaining = nil
+	}
+
+	if len(remaining) != 0 {
 		return utils.ErrBadRequest.WithDetails("Leftover bytes decoding AuthenticatorData")
 	}
 
 	return nil
 }
 
-// If Attestation Data is present, unmarshall that into the appropriate public key structure
-func (a *AuthenticatorData) unmarshalAttestedData(rawAuthData []byte) {
-	a.AttData.AAGUID = rawAuthData[37:53]
-	idLength := binary.BigEndian.Uint16(rawAuthData[53:55])
-	a.AttData.CredentialID = rawAuthData[55 : 55+idLength]
-	a.AttData.CredentialPublicKey = unmarshalCredentialPublicKey(rawAuthData[55+idLength:])
+// If Attestation Data is present, unmarshall that into the appropriate public key
+// structure and return whatever follows it. 🤖
+func (a *AuthenticatorData) unmarshalAttestedData(attData []byte) ([]byte, error) {
+	const aaguidLength = 16
+	if len(attData) < aaguidLength+2 {
+		return nil, utils.ErrBadRequest.WithDetails("Attested credential data truncated")
+	}
+	idLength := int(binary.BigEndian.Uint16(attData[aaguidLength : aaguidLength+2]))
+	if len(attData) < aaguidLength+2+idLength {
+		return nil, utils.ErrBadRequest.WithDetails("Attested credential data credential ID truncated")
+	}
+
+	keyBytes := attData[aaguidLength+2+idLength:]
+	publicKey, read, err := unmarshalCredentialPublicKey(keyBytes)
+	if err != nil {
+		return nil, utils.ErrBadRequest.WithDetails(fmt.Sprintf("Cannot decode credential public key: %v", err))
+	}
+
+	a.AttData.AAGUID = attData[:aaguidLength]
+	a.AttData.CredentialID = attData[aaguidLength+2 : aaguidLength+2+idLength]
+	a.AttData.CredentialPublicKey = publicKey
+	return keyBytes[read:], nil
 }
 
-// Unmarshall the credential's Public Key into CBOR encoding
-func unmarshalCredentialPublicKey(keyBytes []byte) []byte {
+// Unmarshall the credential's Public Key into CBOR encoding, returning it along
+// with the number of bytes it occupied in keyBytes. The re-encoded key is not
+// necessarily the same length as the original, so the count is taken from the
+// decoder rather than from the result. 🤖
+func unmarshalCredentialPublicKey(keyBytes []byte) ([]byte, int, error) {
 	var cborHandler codec.Handle = new(codec.CborHandle)
 	var m interface{}
-	codec.NewDecoderBytes(keyBytes, cborHandler).Decode(&m)
+	dec := codec.NewDecoderBytes(keyBytes, cborHandler)
+	if err := dec.Decode(&m); err != nil {
+		return nil, 0, err
+	}
+	read := dec.NumBytesRead()
 	var rawBytes []byte
 	enc := codec.NewEncoderBytes(&rawBytes, cborHandler)
-	enc.Encode(m)
-	return rawBytes
+	if err := enc.Encode(m); err != nil {
+		return nil, 0, err
+	}
+	return rawBytes, read, nil
 }
 
 // ResidentKeyRequired - Require that the key be private key resident to the client device
